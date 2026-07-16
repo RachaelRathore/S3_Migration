@@ -1,4 +1,4 @@
-# ---- S3 -> GCS bucket migration ----
+# ---- S3 -> GCS bucket migration ---- 
 module "bucket_lifecycle" {
   source = "../../modules/buckets/lifecycle"
 
