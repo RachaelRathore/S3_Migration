@@ -1,0 +1,151 @@
+version: 2.1
+
+# Requires a CircleCI Context named "freightfox-migration" with:
+#   GCLOUD_SERVICE_KEY     - base64-encoded GCP service account JSON key
+#                             (roles/storage.admin + roles/serviceusage.serviceUsageAdmin
+#                             on all 8 projects)
+#   AWS_ACCESS_KEY_ID       - read-only migration IAM user (s3:GetObject,
+#   AWS_SECRET_ACCESS_KEY    s3:GetObjectVersion, s3:ListBucket, s3:GetBucketLocation
+#                             on the 33 source buckets)
+#
+# Bucket names/versioning/public-access are committed in each
+# environments/<env>/terraform.tfvars - nothing to set per-environment here.
+
+executors:
+  tf:
+    docker:
+      - image: hashicorp/terraform:1.7
+    working_directory: ~/repo
+
+commands:
+  gcp_auth:
+    steps:
+      - run:
+          name: Authenticate to GCP
+          command: |
+            echo "$GCLOUD_SERVICE_KEY" | base64 -d > /tmp/gcp-key.json
+            echo 'export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json' >> "$BASH_ENV"
+
+  aws_auth:
+    steps:
+      - run:
+          name: Map AWS creds to Terraform variables
+          command: |
+            if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+              echo "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set - transfer jobs will fail if enable_transfer=true." >&2
+            fi
+            echo "export TF_VAR_aws_access_key_id='$AWS_ACCESS_KEY_ID'" >> "$BASH_ENV"
+            echo "export TF_VAR_aws_secret_access_key='$AWS_SECRET_ACCESS_KEY'" >> "$BASH_ENV"
+
+jobs:
+  plan_buckets:
+    executor: tf
+    parameters:
+      environment:
+        type: string
+    steps:
+      - checkout
+      - gcp_auth
+      - run:
+          name: terraform init
+          command: cd terraform/environments/<< parameters.environment >> && terraform init
+      - run:
+          name: terraform plan
+          command: cd terraform/environments/<< parameters.environment >> && terraform plan -var="enable_transfer=false" -out=tfplan
+      - persist_to_workspace:
+          root: terraform/environments/<< parameters.environment >>
+          paths: [tfplan, .terraform, .terraform.lock.hcl]
+
+  apply_buckets:
+    executor: tf
+    parameters:
+      environment:
+        type: string
+    steps:
+      - checkout
+      - gcp_auth
+      - attach_workspace: { at: terraform/environments/<< parameters.environment >> }
+      - run:
+          name: terraform apply
+          command: cd terraform/environments/<< parameters.environment >> && terraform apply -auto-approve tfplan
+
+  plan_transfer:
+    executor: tf
+    parameters:
+      environment:
+        type: string
+    steps:
+      - checkout
+      - gcp_auth
+      - aws_auth
+      - run:
+          name: terraform init
+          command: cd terraform/environments/<< parameters.environment >> && terraform init
+      - run:
+          name: terraform plan (enable_transfer=true)
+          command: cd terraform/environments/<< parameters.environment >> && terraform plan -var="enable_transfer=true" -out=tfplan
+      - persist_to_workspace:
+          root: terraform/environments/<< parameters.environment >>
+          paths: [tfplan, .terraform, .terraform.lock.hcl]
+
+  apply_transfer:
+    executor: tf
+    parameters:
+      environment:
+        type: string
+    steps:
+      - checkout
+      - gcp_auth
+      - aws_auth
+      - attach_workspace: { at: terraform/environments/<< parameters.environment >> }
+      - run:
+          name: terraform apply (enable_transfer=true)
+          command: cd terraform/environments/<< parameters.environment >> && terraform apply -auto-approve tfplan
+
+workflows:
+  version: 2
+  s3_bucket_migration:
+    jobs:
+      # ---- Stage 1: create the GCS buckets in every project ----
+      - plan_buckets:
+          matrix:
+            parameters:
+              environment: [analytics-dev, analytics-prod, tms-dev, tms-prod, tms-staging, vms-dev, vms-prod, vms-staging]
+          context: freightfox-migration
+
+      - hold_apply_buckets:
+          type: approval
+          requires: [plan_buckets]
+
+      - apply_buckets:
+          matrix:
+            parameters:
+              environment: [analytics-dev, analytics-prod, tms-dev, tms-prod, tms-staging, vms-dev, vms-prod, vms-staging]
+          requires: [hold_apply_buckets]
+          context: freightfox-migration
+          filters: { branches: { only: main } }
+
+      # ---- Stage 2: turn on S3 -> GCS data transfer, once buckets exist ----
+      - hold_start_transfer:
+          type: approval
+          requires: [apply_buckets]
+
+      - plan_transfer:
+          matrix:
+            parameters:
+              environment: [analytics-dev, analytics-prod, tms-dev, tms-prod, tms-staging, vms-dev, vms-prod, vms-staging]
+          requires: [hold_start_transfer]
+          context: freightfox-migration
+          filters: { branches: { only: main } }
+
+      - hold_apply_transfer:
+          type: approval
+          requires: [plan_transfer]
+
+      - apply_transfer:
+          matrix:
+            parameters:
+              environment: [analytics-dev, analytics-prod, tms-dev, tms-prod, tms-staging, vms-dev, vms-prod, vms-staging]
+          requires: [hold_apply_transfer]
+          context: freightfox-migration
+          filters: { branches: { only: main } }
